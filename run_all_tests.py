@@ -2,6 +2,17 @@
 
 A failure in any single module is captured into the report and does not
 prevent the rest of the suite from running.
+
+Round-4 mode (current default):
+  Round 3 produced clean passes for sections 01, 02, 03, 06, 08, 10, 11.
+  We skip them by default to save quota and focus on the open failures:
+    - 04 Multimodal       (HTTPS image URL still 500)
+    - 05 Tool calling     (OpenAI role:"tool" continuation 500 — all 3 shapes)
+    - 07 MAF integration  (downstream of 05)
+    - 09 Context limit    (baseline 2k probe 500)
+    - 12 Anthropic tools  (NEW — full Anthropic tool_result continuation)
+
+Run the full suite again with `python run_all_tests.py --full`.
 """
 from __future__ import annotations
 
@@ -13,20 +24,24 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
-MODULES = [
+# Sections that already passed in Round 3 — re-enable with --full.
+PASSED_MODULES = [
     "tests.test_01_openai_basic",
     "tests.test_02_openai_params",
     "tests.test_03_streaming",
-    "tests.test_04_multimodal",
-    "tests.test_05_tool_calling",
     "tests.test_06_anthropic_sdk",
-    "tests.test_07_maf_integration",
-    # The parameter-effectiveness probes need fresh rate-limit budget
-    # because they fire many small calls in quick succession.
     "tests.test_10_reasoning_params",
     "tests.test_11_temperature_effectiveness",
-    # Heavy / quota-burning tests last
     "tests.test_08_concurrency",
+]
+
+# Sections that still have ❌ failures, plus the new Anthropic tool round-trip.
+FAILING_MODULES = [
+    "tests.test_04_multimodal",
+    "tests.test_05_tool_calling",
+    "tests.test_07_maf_integration",
+    "tests.test_12_anthropic_tools",
+    # Context limit is quota-heavy, keep it last.
     "tests.test_09_context_limit",
 ]
 
@@ -35,13 +50,17 @@ def main() -> int:
     # ensure project root on sys.path so `tests.*` imports work regardless of cwd
     sys.path.insert(0, str(ROOT))
 
+    full = "--full" in sys.argv
+    modules = (PASSED_MODULES + FAILING_MODULES) if full else FAILING_MODULES
+
     from tests import config
     from tests.reporter import FAIL, Report
 
     print("=" * 70)
-    print("ZF AI Gateway — full test suite")
+    print(f"ZF AI Gateway — {'FULL' if full else 'ROUND-4 (failures only)'} test suite")
     print("=" * 70)
     print(config.summary())
+    print(f"Modules to run: {len(modules)}")
     print("=" * 70)
 
     report = Report()
@@ -49,9 +68,10 @@ def main() -> int:
         "BASE_URL": config.BASE_URL,
         "MODEL": config.MODEL,
         "TOOL_MODEL": config.TOOL_MODEL,
+        "SUITE_MODE": "full" if full else "round-4 (failures + new anthropic tools)",
     }
 
-    for mod_name in MODULES:
+    for mod_name in modules:
         print(f"\n>>> {mod_name}")
         t0 = time.perf_counter()
         try:
