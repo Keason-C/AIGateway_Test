@@ -56,6 +56,29 @@ def _import_anthropic_client():
     )
 
 
+def _import_agent_class():
+    """The canonical `agent_framework.Agent` class (preferred over
+    `client.as_agent(...)`) — matches the official `02_add_tools.py` sample.
+    """
+    try:
+        from agent_framework import Agent  # type: ignore
+        return Agent
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _new_agent(client, **kwargs):
+    """Build an Agent using the canonical `Agent(client=client, ...)` form
+    if the class is importable; fall back to `client.as_agent(...)` (older /
+    convenience API) otherwise. Both forms are semantically equivalent per
+    the MAF skill.
+    """
+    AgentCls = _import_agent_class()
+    if AgentCls is not None:
+        return AgentCls(client=client, **kwargs)
+    return client.as_agent(**kwargs)
+
+
 def _import_async_anthropic():
     """Raw async Anthropic client — needed to point at a custom base_url."""
     from anthropic import AsyncAnthropic  # type: ignore
@@ -123,7 +146,7 @@ async def _run_async(report: Report) -> None:
     # ── 1. Single-turn agent.run ────────────────────────────────────────────
     try:
         client = _new_client()
-        agent = client.as_agent(name="ZFAgentA", instructions="You are concise.")
+        agent = _new_agent(client, name="ZFAgentA", instructions="You are concise.")
         result = await agent.run("Reply with the word: pong")
         text = getattr(result, "text", None) or str(result)
         ok = "pong" in text.lower()
@@ -134,7 +157,7 @@ async def _run_async(report: Report) -> None:
     # ── 2. Streaming via agent.run(..., stream=True) ────────────────────────
     try:
         client = _new_client()
-        agent = client.as_agent(name="ZFAgentB", instructions="You are concise.")
+        agent = _new_agent(client, name="ZFAgentB", instructions="You are concise.")
         chunks: list[str] = []
         async for chunk in agent.run("Count from 1 to 3.", stream=True):
             t = getattr(chunk, "text", None)
@@ -177,7 +200,8 @@ async def _run_async(report: Report) -> None:
                     return n * n
 
             client = _new_client()
-            agent = client.as_agent(
+            agent = _new_agent(
+                client,
                 name="MathAgentA",
                 instructions="When asked to square a number, call the square tool. "
                              "After it returns, reply with just the number.",
@@ -215,7 +239,8 @@ async def _run_async(report: Report) -> None:
                     return a + b
 
             client = _new_client()
-            agent = client.as_agent(
+            agent = _new_agent(
+                client,
                 name="MathAgentB",
                 instructions="When asked to add numbers, call the add tool.",
                 tools=[add],
@@ -266,7 +291,8 @@ async def _run_async(report: Report) -> None:
                     return f"The current time in {timezone} is 14:30."
 
             client = _new_client()
-            agent = client.as_agent(
+            agent = _new_agent(
+                client,
                 name="ConciergeAgent",
                 instructions="You have two tools: get_weather and get_time. "
                              "Pick the right one for the user's question and answer with the result.",
@@ -292,27 +318,31 @@ async def _run_async(report: Report) -> None:
     else:
         try:
             client = _new_client()
-            writer = client.as_agent(
+            writer = _new_agent(
+                client,
                 name="Writer", instructions="Write one short sentence about the topic.",
             )
-            shortener = client.as_agent(
+            shortener = _new_agent(
+                client,
                 name="Shortener", instructions="Rewrite the sentence in 3 words or fewer.",
             )
 
             workflow = None
             build_err: Exception | None = None
             if kind == "workflow":
+                # Canonical sample shape (07_first_graph_workflow.py) goes first;
+                # the older fluent forms are fallbacks for older releases.
                 tries = [
-                    lambda: (BuilderCls()
-                             .set_start_executor(writer)
-                             .add_edge(writer, shortener)
-                             .build()),
-                    lambda: (BuilderCls()
-                             .add_edge(writer, shortener)
-                             .set_start_executor(writer)
-                             .build()),
                     lambda: (BuilderCls(start_executor=writer)
                              .add_edge(writer, shortener)
+                             .build()),
+                    lambda: (BuilderCls()
+                             .set_start_executor(writer)
+                             .add_edge(writer, shortener)
+                             .build()),
+                    lambda: (BuilderCls()
+                             .add_edge(writer, shortener)
+                             .set_start_executor(writer)
                              .build()),
                 ]
                 for t in tries:
@@ -334,9 +364,27 @@ async def _run_async(report: Report) -> None:
                 report.add(SECTION, "workflow build", FAIL,
                            f"all builder shapes failed | last={short(repr(build_err), 200)}")
             else:
+                # Canonical: `events = await workflow.run(...)` returns a
+                # WorkflowRunResult with `.get_outputs()` / `.get_final_state()`.
+                # Fall back to run_stream / plain-text extract for older shapes.
                 output_text = ""
+                final_state = ""
                 ran = False
-                if hasattr(workflow, "run_stream"):
+                try:
+                    events = await workflow.run("the moon")
+                    if hasattr(events, "get_outputs"):
+                        outs = events.get_outputs() or []
+                        output_text = "; ".join(str(o) for o in outs)
+                        if hasattr(events, "get_final_state"):
+                            final_state = str(events.get_final_state())
+                    else:  # very old API — just stringify
+                        output_text = (getattr(events, "text", None)
+                                        or getattr(events, "output", None)
+                                        or str(events))
+                    ran = True
+                except Exception as run_err:  # noqa: BLE001
+                    build_err = run_err
+                if not ran and hasattr(workflow, "run_stream"):
                     try:
                         async for event in workflow.run_stream("the moon"):
                             data = (getattr(event, "data", None)
@@ -345,18 +393,14 @@ async def _run_async(report: Report) -> None:
                             if data:
                                 output_text = str(data)
                         ran = True
-                    except Exception:  # noqa: BLE001
-                        ran = False
-                if not ran and hasattr(workflow, "run"):
-                    result = await workflow.run("the moon")
-                    output_text = (getattr(result, "text", None)
-                                    or getattr(result, "output", None)
-                                    or str(result))
+                    except Exception as run_err2:  # noqa: BLE001
+                        build_err = run_err2
+                detail = short(output_text, 140) + (f" | state={final_state}" if final_state else "")
                 report.add(
                     SECTION,
                     f"workflow run (writer → shortener) [{kind}]",
                     PASS if output_text.strip() else WARN,
-                    short(output_text, 160),
+                    detail if ran else f"run failed: {short(repr(build_err), 200)}",
                 )
         except Exception as e:  # noqa: BLE001
             report.capture_exception(SECTION, "workflow execution", e)
