@@ -122,23 +122,38 @@ async def _run_async(report: Report) -> None:
     except Exception as e:  # noqa: BLE001
         report.capture_exception(SECTION, "agent.run(stream=True)", e)
 
-    # 3. Function tool — Python function with Annotated args
+    # 3. Function tool — canonical MAF pattern from
+    #    python/samples/02-agents/providers/openai/chat_completion_client_with_function_tools.py
+    #    The 500 we saw in round 2 likely originated from the gateway's
+    #    `tool_result` continuation path (the same 500 we hit in test_05). MAF
+    #    omits `content` on the assistant turn (spec-correct), so if test_05
+    #    variant A works against the gateway, this should too.
     tool, Field = _import_tool()
     if tool is None:
         report.add(SECTION, "@tool function call", SKIP, "`tool` decorator not importable")
     else:
+        # 3a — Canonical pattern: @tool + Annotated[T, Field(description=…)]
         try:
-            @tool
-            def square(
-                n: Annotated[int, (Field(description="The integer to square") if Field else "n")],
-            ) -> int:
-                """Return n squared."""
-                return n * n
+            if Field is not None:
+                @tool
+                def square(
+                    n: Annotated[int, Field(description="The integer to square.")],
+                ) -> int:
+                    """Return n squared."""
+                    return n * n
+            else:
+                @tool
+                def square(  # type: ignore[no-redef]
+                    n: Annotated[int, "The integer to square."],
+                ) -> int:
+                    """Return n squared."""
+                    return n * n
 
             client = _new_client()
             agent = client.as_agent(
                 name="MathAgent",
-                instructions="Use the square tool when asked for a square.",
+                instructions="When asked to square a number, call the square tool. "
+                             "After it returns, reply with just the number.",
                 tools=[square],
             )
             result = await agent.run("Use your tool to square the number 7.")
@@ -146,12 +161,50 @@ async def _run_async(report: Report) -> None:
             ok = "49" in text
             report.add(
                 SECTION,
-                "@tool function call (square(7)=49)",
+                "@tool function call (canonical, square(7)=49)",
                 PASS if ok else WARN,
-                short(text, 140),
+                short(text, 160),
             )
         except Exception as e:  # noqa: BLE001
-            report.capture_exception(SECTION, "@tool function call", e)
+            report.capture_exception(SECTION, "@tool function call (canonical)", e)
+
+        # 3b — Plain `def`-with-annotations (no @tool decorator): MAF also
+        # accepts this and infers the schema. Same gateway path, different
+        # client-side construction — useful for telling MAF wrapping issues
+        # apart from gateway issues.
+        try:
+            if Field is not None:
+                def add(
+                    a: Annotated[int, Field(description="First operand.")],
+                    b: Annotated[int, Field(description="Second operand.")],
+                ) -> int:
+                    """Add two integers."""
+                    return a + b
+            else:
+                def add(  # type: ignore[no-redef]
+                    a: Annotated[int, "First operand."],
+                    b: Annotated[int, "Second operand."],
+                ) -> int:
+                    """Add two integers."""
+                    return a + b
+
+            client = _new_client()
+            agent = client.as_agent(
+                name="MathAgent2",
+                instructions="When asked to add numbers, call the add tool.",
+                tools=[add],
+            )
+            result = await agent.run("Use the tool to add 15 and 27.")
+            text = getattr(result, "text", None) or str(result)
+            ok = "42" in text
+            report.add(
+                SECTION,
+                "plain def tool (add(15,27)=42)",
+                PASS if ok else WARN,
+                short(text, 160),
+            )
+        except Exception as e:  # noqa: BLE001
+            report.capture_exception(SECTION, "plain def tool", e)
 
     # 4. 2-agent workflow — prefer WorkflowBuilder, fall back to SequentialBuilder
     BuilderCls, kind, fqn = _import_workflow_builder()

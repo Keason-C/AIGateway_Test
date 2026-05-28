@@ -57,6 +57,17 @@ Or run a single module directly:
 python -m tests.test_02_openai_params
 ```
 
+### Re-running just the context-window probe
+
+Round 3 made `test_09_context_limit` runnable standalone, because the
+test_08 concurrency burst sometimes contaminates rate-limit state and makes
+the binary-search baseline fail spuriously. To get a clean reading:
+
+```bash
+python -m tests.test_09_context_limit
+# → writes results/test_09_only.md
+```
+
 ## Configuration
 
 `.env` keys (only `ZF_API_KEY` is required):
@@ -75,7 +86,8 @@ python -m tests.test_02_openai_params
 
 ## Known gotchas (already baked into the tests)
 
-- The gateway returns **HTTP 500 when `max_tokens` is sent on `/v1/chat/completions`**. Test 01 explicitly asserts this so you'll see whether the behavior still matches the documentation.
+- The gateway used to return **HTTP 500 when `max_tokens` is sent on `/v1/chat/completions`**, but round-2 testing showed it's been fixed. Test 01 still probes it so we'll know if it regresses.
 - There is **no server-side memory**. Multi-turn tests pre-build the `messages` list each call.
-- PDF content is **not** accepted as a `document` block. The multimodal test exercises three workarounds.
+- PDFs: the speculative OpenAI `file` block now also works, in addition to the PyPDF2-text and pymupdf-as-image strategies. Test 04 exercises all three.
 - The Microsoft Agent Framework's `OpenAIChatClient` hits `/responses` (OpenAI Responses API) and 404s on this gateway. We use `OpenAIChatCompletionClient` instead — which hits `/chat/completions`.
+- On the **assistant-with-tool_calls** turn, the gateway 500s if `content: ""` is sent. The spec-correct shape (and MAF's wire shape) is to **omit `content` entirely**. Test 05 now exercises all three variants — omit / null / `""` — so we can see which the gateway accepts.

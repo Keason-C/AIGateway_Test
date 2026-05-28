@@ -4,15 +4,23 @@ Notes:
  - We use ZF_TOOL_MODEL if set, otherwise fall back to ZF_MODEL.
  - tool_choice values exercised: "auto", "required", "none", and a specific tool spec.
  - We also feed a tool result back into history and verify the model uses it.
+
+Wire format note (round-3 fix):
+ - On the assistant-with-tool_calls turn, we **omit the `content` field entirely**
+   when the model didn't return any text. MAF 1.0's OpenAIChatCompletionClient
+   does the same, and the OpenAI OpenAPI spec only requires `role` for that
+   message variant. Sending `content: ""` triggers 500 on some gateways that
+   strictly validate the body upstream.
 """
 from __future__ import annotations
 
 import json
 
+import httpx
 from openai import OpenAI
 
 from . import config
-from .reporter import FAIL, PASS, Report, WARN, short
+from .reporter import FAIL, INFO, PASS, Report, WARN, short
 
 SECTION = "05_tool_calling"
 
@@ -165,43 +173,139 @@ def run(report: Report) -> None:
     except Exception as e:  # noqa: BLE001
         report.capture_exception(SECTION, "parallel_tool_calls=true", e)
 
-    # 6. Tool result continuation — does the model absorb a tool_result?
-    try:
+    # 6. Tool result continuation — three wire-format variants
+    #
+    # Round 2 sent `content: ""` on the assistant turn and got 500. MAF source
+    # omits content entirely. Try all three of the spec-allowed forms so we know
+    # which one this gateway is happy with:
+    #   A. content key OMITTED entirely (MAF's choice, spec-compliant)
+    #   B. content explicitly null   (also spec-compliant)
+    #   C. content empty string ""    (technically spec-compliant; previously 500'd)
+    def _continuation(variant_label: str, build_assistant_msg):
         history = [{"role": "user", "content": "What's the weather in Munich?"}]
-        r1 = c.chat.completions.create(
-            model=model, messages=history, tools=[WEATHER_TOOL], tool_choice="auto",
-        )
+        try:
+            r1 = c.chat.completions.create(
+                model=model, messages=history, tools=[WEATHER_TOOL], tool_choice="auto",
+            )
+        except Exception as e:  # noqa: BLE001
+            report.capture_exception(SECTION, f"tool continuation {variant_label} (turn 1)", e)
+            return
         tcs = r1.choices[0].message.tool_calls or []
         if not tcs:
-            report.add(SECTION, "tool result continuation", WARN,
+            report.add(SECTION, f"tool continuation {variant_label}", WARN,
                        "first turn did not call the tool — cannot test continuation")
-        else:
-            call = tcs[0]
-            history.append({
-                "role": "assistant",
-                "content": r1.choices[0].message.content or "",
-                "tool_calls": [{
-                    "id": call.id,
-                    "type": "function",
-                    "function": {"name": call.function.name, "arguments": call.function.arguments},
-                }],
-            })
-            history.append({
-                "role": "tool",
-                "tool_call_id": call.id,
-                "content": json.dumps({"temperature_c": 22, "condition": "sunny"}),
-            })
+            return
+        call = tcs[0]
+        history.append(build_assistant_msg(r1, call))
+        history.append({
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": json.dumps({"temperature_c": 22, "condition": "sunny"}),
+        })
+        try:
             r2 = c.chat.completions.create(model=model, messages=history, tools=[WEATHER_TOOL])
             final = r2.choices[0].message.content or ""
             ok = "22" in final or "sunny" in final.lower()
             report.add(
                 SECTION,
-                "tool result continuation",
+                f"tool continuation {variant_label}",
                 PASS if ok else WARN,
                 f"final answer: {short(final, 120)}",
             )
+        except Exception as e:  # noqa: BLE001
+            report.capture_exception(SECTION, f"tool continuation {variant_label} (turn 2)", e)
+
+    # Variant A: omit `content` entirely — MAF's wire shape
+    _continuation(
+        "A · content OMITTED (MAF default)",
+        lambda r1, call: {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": call.id, "type": "function",
+                "function": {"name": call.function.name, "arguments": call.function.arguments},
+            }],
+        },
+    )
+    # Variant B: explicit null
+    _continuation(
+        "B · content=None (explicit null)",
+        lambda r1, call: {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": call.id, "type": "function",
+                "function": {"name": call.function.name, "arguments": call.function.arguments},
+            }],
+        },
+    )
+    # Variant C: empty string (the one that previously 500'd)
+    _continuation(
+        "C · content='' (empty string — previously 500'd)",
+        lambda r1, call: {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": call.id, "type": "function",
+                "function": {"name": call.function.name, "arguments": call.function.arguments},
+            }],
+        },
+    )
+
+    # 7. Raw httpx: send a hand-built tool_result continuation and dump the
+    # literal wire body so the user can see exactly what's going over.
+    try:
+        weather_call_id = "call_zf_test_001"
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": "What's the weather in Munich?"},
+                {
+                    # The MAF wire shape: NO content key.
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": weather_call_id,
+                        "type": "function",
+                        "function": {"name": "get_weather",
+                                     "arguments": json.dumps({"city": "Munich"})},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": weather_call_id,
+                    "content": json.dumps({"temperature_c": 22, "condition": "sunny"}),
+                },
+            ],
+            "tools": [WEATHER_TOOL],
+        }
+        wire_preview = short(json.dumps(body, ensure_ascii=False), 220)
+        with httpx.Client(timeout=60.0) as h:
+            resp = h.post(
+                config.BASE_URL + "/chat/completions",
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {config.API_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+        if resp.status_code == 200:
+            data = resp.json()
+            final = (data["choices"][0]["message"].get("content") or "")
+            ok = "22" in final or "sunny" in final.lower()
+            report.add(
+                SECTION,
+                "raw httpx tool continuation (MAF-shape, content omitted)",
+                PASS if ok else WARN,
+                f"status=200 | final={short(final, 80)} | sent={wire_preview}",
+            )
+        else:
+            report.add(
+                SECTION,
+                "raw httpx tool continuation (MAF-shape, content omitted)",
+                FAIL,
+                f"status={resp.status_code} | body={short(resp.text, 160)} | sent={wire_preview}",
+            )
     except Exception as e:  # noqa: BLE001
-        report.capture_exception(SECTION, "tool result continuation", e)
+        report.capture_exception(SECTION, "raw httpx tool continuation", e)
 
 
 if __name__ == "__main__":
