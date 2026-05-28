@@ -1,317 +1,384 @@
-"""Tool / function calling via the **Anthropic** SDK — full continuation round-trip.
+"""Microsoft Agent Framework + AnthropicClient driving the ZF gateway.
 
-This is the direct counterpart to `test_05_tool_calling` (which exercises the
-OpenAI Chat Completions wire format). Round-3 results showed:
+This is the **direct mirror** of `test_07_maf_integration` but using
+`agent-framework-anthropic`'s `AnthropicClient` instead of
+`agent_framework.openai.OpenAIChatCompletionClient`. Same MAF code paths
+(`agent.run`, `@tool`, plain-def tool, workflow), same gateway, different
+protocol underneath.
 
-  - OpenAI side: turn-1 `tool_calls` works ✅, but feeding `role:"tool"` back
-    in turn-2 → **gateway 500** across every content-shape variant.
-  - Anthropic side (test_06): turn-1 `tool_use` works ✅, **but we never
-    tested the continuation**.
+Round-3 finding to confirm:
+  - test_07 (MAF + OpenAI client) → @tool and plain-def-tool both 500'd on
+    the gateway's tool_result continuation path.
+  - test_05 (raw OpenAI SDK + tools) → same 500.
+  - test_06 (raw Anthropic SDK, turn 1 only) → 200, but continuation untested.
 
-This module closes that gap. The Anthropic continuation wire shape is:
+If THIS section's @tool checks pass, the answer for production MAF code on
+this gateway is concrete: **swap to AnthropicClient**.
 
-    user      → "What's the weather in Munich?"
-    assistant → [text?, tool_use(id, name, input)]   (echo back as-is)
-    user      → [tool_result(tool_use_id, content)]
-    assistant → final natural-language reply that references the tool output
+Wiring:
+  AnthropicClient(model=..., anthropic_client=AsyncAnthropic(
+      api_key=ZF_API_KEY,
+      base_url=ZF gateway URL without /v1 (the Anthropic SDK appends /v1 itself),
+  ))
 
-If turn-2 also 500s, the gateway is broken on BOTH protocols. If turn-2
-succeeds, the right Round-4 advice is "use the Anthropic protocol for tools
-on this gateway".
+Falls back to SKIP / FAIL with a clear reason if `agent-framework-anthropic`
+or the `anthropic` SDK isn't installed.
 """
 from __future__ import annotations
 
-import json
-
-import anthropic
+import asyncio
+import importlib
+from typing import Annotated
 
 from . import config
-from .reporter import FAIL, INFO, PASS, Report, WARN, short
+from .reporter import FAIL, PASS, Report, SKIP, WARN, short
 
-SECTION = "12_anthropic_tools"
-
-WEATHER_TOOL = {
-    "name": "get_weather",
-    "description": "Get the current weather for a given city.",
-    "input_schema": {
-        "type": "object",
-        "properties": {"city": {"type": "string", "description": "City name"}},
-        "required": ["city"],
-    },
-}
-
-TIME_TOOL = {
-    "name": "get_time",
-    "description": "Return the current local time for a given IANA timezone.",
-    "input_schema": {
-        "type": "object",
-        "properties": {"timezone": {"type": "string"}},
-        "required": ["timezone"],
-    },
-}
+SECTION = "12_maf_anthropic"
 
 
-def _c() -> anthropic.Anthropic:
-    return anthropic.Anthropic(
-        base_url=config.ANTHROPIC_BASE_URL,
-        api_key=config.API_KEY,
-        timeout=60.0,
-        max_retries=0,
+def _import_anthropic_client():
+    """`agent_framework.anthropic.AnthropicClient` (lazy-shim into
+    `agent_framework_anthropic`) — try both import paths.
+    """
+    candidates = [
+        ("agent_framework.anthropic", "AnthropicClient"),
+        ("agent_framework_anthropic", "AnthropicClient"),
+    ]
+    last_err: Exception | None = None
+    for module_name, cls_name in candidates:
+        try:
+            mod = importlib.import_module(module_name)
+            return getattr(mod, cls_name), f"{module_name}.{cls_name}"
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+    raise ImportError(
+        f"could not import AnthropicClient from any of: {candidates}; last={last_err!r}"
     )
 
 
-def _content_blocks_for_echo(message) -> list[dict]:
-    """Re-serialize the assistant's response blocks back into wire form.
-
-    The Anthropic SDK returns rich objects (`TextBlock`, `ToolUseBlock`).
-    Continuation requires us to send the same content array back; the SDK
-    accepts the dict shape directly.
-    """
-    out: list[dict] = []
-    for b in message.content:
-        t = getattr(b, "type", None)
-        if t == "text":
-            out.append({"type": "text", "text": b.text})
-        elif t == "tool_use":
-            out.append({
-                "type": "tool_use",
-                "id": b.id,
-                "name": b.name,
-                "input": b.input,
-            })
-        else:
-            # Unknown block — best-effort dump
-            out.append(getattr(b, "model_dump", lambda: {"type": t})())
-    return out
+def _import_async_anthropic():
+    """Raw async Anthropic client — needed to point at a custom base_url."""
+    from anthropic import AsyncAnthropic  # type: ignore
+    return AsyncAnthropic
 
 
-def _first_tool_use(message):
-    for b in message.content:
-        if getattr(b, "type", None) == "tool_use":
-            return b
-    return None
+def _import_tool():
+    """`tool` decorator + Field — used to annotate function tools."""
+    try:
+        from agent_framework import tool  # type: ignore
+    except Exception:  # noqa: BLE001
+        tool = None
+    try:
+        from pydantic import Field  # type: ignore
+    except Exception:  # noqa: BLE001
+        Field = None  # type: ignore
+    return tool, Field
+
+
+def _import_workflow_builder():
+    """Mirror of test_07 — accept WorkflowBuilder or SequentialBuilder."""
+    candidates = [
+        ("agent_framework", "WorkflowBuilder", "workflow"),
+        ("agent_framework.workflows", "WorkflowBuilder", "workflow"),
+        ("agent_framework", "SequentialBuilder", "sequential"),
+        ("agent_framework.workflows", "SequentialBuilder", "sequential"),
+    ]
+    for module_name, cls_name, kind in candidates:
+        try:
+            mod = importlib.import_module(module_name)
+            cls = getattr(mod, cls_name, None)
+            if cls is not None:
+                return cls, kind, f"{module_name}.{cls_name}"
+        except Exception:  # noqa: BLE001
+            continue
+    return None, None, ""
+
+
+async def _run_async(report: Report) -> None:
+    # ── Imports & client construction ───────────────────────────────────────
+    try:
+        ClientCls, fqn = _import_anthropic_client()
+    except Exception as e:  # noqa: BLE001
+        report.add(SECTION, "import AnthropicClient", FAIL, short(str(e), 240))
+        return
+    report.add(SECTION, "import AnthropicClient", PASS, fqn)
+
+    try:
+        AsyncAnthropic = _import_async_anthropic()
+    except Exception as e:  # noqa: BLE001
+        report.add(SECTION, "import anthropic.AsyncAnthropic", FAIL, short(str(e), 240))
+        return
+
+    # Pre-built AsyncAnthropic pointed at the ZF gateway. The Anthropic SDK
+    # appends /v1/messages itself, so we use config.ANTHROPIC_BASE_URL (no /v1).
+    def _new_client():
+        raw = AsyncAnthropic(
+            api_key=config.API_KEY,
+            base_url=config.ANTHROPIC_BASE_URL,
+            timeout=60.0,
+            max_retries=0,
+        )
+        return ClientCls(model=config.TOOL_MODEL, anthropic_client=raw)
+
+    # ── 1. Single-turn agent.run ────────────────────────────────────────────
+    try:
+        client = _new_client()
+        agent = client.as_agent(name="ZFAgentA", instructions="You are concise.")
+        result = await agent.run("Reply with the word: pong")
+        text = getattr(result, "text", None) or str(result)
+        ok = "pong" in text.lower()
+        report.add(SECTION, "agent.run (single-turn)", PASS if ok else WARN, short(text, 120))
+    except Exception as e:  # noqa: BLE001
+        report.capture_exception(SECTION, "agent.run (single-turn)", e)
+
+    # ── 2. Streaming via agent.run(..., stream=True) ────────────────────────
+    try:
+        client = _new_client()
+        agent = client.as_agent(name="ZFAgentB", instructions="You are concise.")
+        chunks: list[str] = []
+        async for chunk in agent.run("Count from 1 to 3.", stream=True):
+            t = getattr(chunk, "text", None)
+            if t:
+                chunks.append(t)
+        joined = "".join(chunks)
+        report.add(
+            SECTION,
+            "agent.run(stream=True)",
+            PASS if joined.strip() else FAIL,
+            f"chunks={len(chunks)} text={short(joined, 100)}",
+        )
+    except Exception as e:  # noqa: BLE001
+        report.capture_exception(SECTION, "agent.run(stream=True)", e)
+
+    # ── 3. @tool function calls — THE headline check ────────────────────────
+    # Mirrors test_07's 3a/3b exactly, just under a different client. If these
+    # PASS here while failing in test_07, the practical advice is:
+    # use MAF + AnthropicClient (not OpenAIChatCompletionClient) on this gateway.
+    tool, Field = _import_tool()
+    if tool is None:
+        report.add(SECTION, "@tool function call", SKIP, "`tool` decorator not importable")
+    else:
+        # 3a — Canonical: @tool + Annotated[T, Field(description=…)] + docstring.
+        # approval_mode="never_require" so the test doesn't block on a prompt.
+        try:
+            if Field is not None:
+                @tool(approval_mode="never_require")
+                def square(
+                    n: Annotated[int, Field(description="The integer to square.")],
+                ) -> int:
+                    """Return n squared."""
+                    return n * n
+            else:
+                @tool(approval_mode="never_require")
+                def square(  # type: ignore[no-redef]
+                    n: Annotated[int, "The integer to square."],
+                ) -> int:
+                    """Return n squared."""
+                    return n * n
+
+            client = _new_client()
+            agent = client.as_agent(
+                name="MathAgentA",
+                instructions="When asked to square a number, call the square tool. "
+                             "After it returns, reply with just the number.",
+                tools=[square],
+            )
+            result = await agent.run("Use your tool to square the number 7.")
+            text = getattr(result, "text", None) or str(result)
+            ok = "49" in text
+            report.add(
+                SECTION,
+                "@tool function call (canonical, square(7)=49)",
+                PASS if ok else WARN,
+                short(text, 160),
+            )
+        except Exception as e:  # noqa: BLE001
+            report.capture_exception(SECTION, "@tool function call (canonical)", e)
+
+        # 3b — Plain def with Annotated, no @tool decorator. MAF infers the
+        # schema from annotations + docstring. Same gateway path, different
+        # client-side construction.
+        try:
+            if Field is not None:
+                def add(
+                    a: Annotated[int, Field(description="First operand.")],
+                    b: Annotated[int, Field(description="Second operand.")],
+                ) -> int:
+                    """Add two integers."""
+                    return a + b
+            else:
+                def add(  # type: ignore[no-redef]
+                    a: Annotated[int, "First operand."],
+                    b: Annotated[int, "Second operand."],
+                ) -> int:
+                    """Add two integers."""
+                    return a + b
+
+            client = _new_client()
+            agent = client.as_agent(
+                name="MathAgentB",
+                instructions="When asked to add numbers, call the add tool.",
+                tools=[add],
+            )
+            result = await agent.run("Use the tool to add 15 and 27.")
+            text = getattr(result, "text", None) or str(result)
+            ok = "42" in text
+            report.add(
+                SECTION,
+                "plain def tool (add(15,27)=42)",
+                PASS if ok else WARN,
+                short(text, 160),
+            )
+        except Exception as e:  # noqa: BLE001
+            report.capture_exception(SECTION, "plain def tool", e)
+
+        # 3c — Multi-tool agent: two tools, model picks the right one.
+        # Anthropic protocol uses tool_choice={"type":"auto"} natively; MAF
+        # handles the encoding for us.
+        try:
+            if Field is not None:
+                @tool(approval_mode="never_require")
+                def get_weather(
+                    location: Annotated[str, Field(description="City name.")],
+                ) -> str:
+                    """Get the current weather for a city."""
+                    return f"The weather in {location} is sunny, 22°C."
+
+                @tool(approval_mode="never_require")
+                def get_time(
+                    timezone: Annotated[str, Field(description="IANA timezone, e.g. Asia/Shanghai.")],
+                ) -> str:
+                    """Get the current local time for a timezone."""
+                    return f"The current time in {timezone} is 14:30."
+            else:
+                @tool(approval_mode="never_require")
+                def get_weather(  # type: ignore[no-redef]
+                    location: Annotated[str, "City name."],
+                ) -> str:
+                    """Get the current weather for a city."""
+                    return f"The weather in {location} is sunny, 22°C."
+
+                @tool(approval_mode="never_require")
+                def get_time(  # type: ignore[no-redef]
+                    timezone: Annotated[str, "IANA timezone."],
+                ) -> str:
+                    """Get the current local time for a timezone."""
+                    return f"The current time in {timezone} is 14:30."
+
+            client = _new_client()
+            agent = client.as_agent(
+                name="ConciergeAgent",
+                instructions="You have two tools: get_weather and get_time. "
+                             "Pick the right one for the user's question and answer with the result.",
+                tools=[get_weather, get_time],
+            )
+            result = await agent.run("What's the weather in Munich right now?")
+            text = getattr(result, "text", None) or str(result)
+            ok = ("22" in text) or ("sunny" in text.lower()) or ("munich" in text.lower())
+            report.add(
+                SECTION,
+                "multi-tool agent (weather vs time, model picks weather)",
+                PASS if ok else WARN,
+                short(text, 160),
+            )
+        except Exception as e:  # noqa: BLE001
+            report.capture_exception(SECTION, "multi-tool agent", e)
+
+    # ── 4. Two-agent workflow (writer → shortener) ──────────────────────────
+    BuilderCls, kind, fqn = _import_workflow_builder()
+    if BuilderCls is None:
+        report.add(SECTION, "workflow (2-agent)", SKIP,
+                   "neither WorkflowBuilder nor SequentialBuilder importable")
+    else:
+        try:
+            client = _new_client()
+            writer = client.as_agent(
+                name="Writer", instructions="Write one short sentence about the topic.",
+            )
+            shortener = client.as_agent(
+                name="Shortener", instructions="Rewrite the sentence in 3 words or fewer.",
+            )
+
+            workflow = None
+            build_err: Exception | None = None
+            if kind == "workflow":
+                tries = [
+                    lambda: (BuilderCls()
+                             .set_start_executor(writer)
+                             .add_edge(writer, shortener)
+                             .build()),
+                    lambda: (BuilderCls()
+                             .add_edge(writer, shortener)
+                             .set_start_executor(writer)
+                             .build()),
+                    lambda: (BuilderCls(start_executor=writer)
+                             .add_edge(writer, shortener)
+                             .build()),
+                ]
+                for t in tries:
+                    try:
+                        workflow = t()
+                        break
+                    except Exception as inner:  # noqa: BLE001
+                        build_err = inner
+            else:  # sequential
+                try:
+                    workflow = BuilderCls().add_agents([writer, shortener]).build()
+                except Exception:  # noqa: BLE001
+                    try:
+                        workflow = BuilderCls().participants([writer, shortener]).build()
+                    except Exception as inner2:  # noqa: BLE001
+                        build_err = inner2
+
+            if workflow is None:
+                report.add(SECTION, "workflow build", FAIL,
+                           f"all builder shapes failed | last={short(repr(build_err), 200)}")
+            else:
+                output_text = ""
+                ran = False
+                if hasattr(workflow, "run_stream"):
+                    try:
+                        async for event in workflow.run_stream("the moon"):
+                            data = (getattr(event, "data", None)
+                                    or getattr(event, "output", None)
+                                    or getattr(event, "text", None))
+                            if data:
+                                output_text = str(data)
+                        ran = True
+                    except Exception:  # noqa: BLE001
+                        ran = False
+                if not ran and hasattr(workflow, "run"):
+                    result = await workflow.run("the moon")
+                    output_text = (getattr(result, "text", None)
+                                    or getattr(result, "output", None)
+                                    or str(result))
+                report.add(
+                    SECTION,
+                    f"workflow run (writer → shortener) [{kind}]",
+                    PASS if output_text.strip() else WARN,
+                    short(output_text, 160),
+                )
+        except Exception as e:  # noqa: BLE001
+            report.capture_exception(SECTION, "workflow execution", e)
 
 
 def run(report: Report) -> None:
     report.section(
         SECTION,
-        "12 · Anthropic SDK · tool calling round-trip",
-        "Full two-turn tool round-trip (tool_use → tool_result → final answer) via the "
-        f"Anthropic SDK against `{config.ANTHROPIC_BASE_URL}`. Direct counterpart to "
-        "section 05 — same gateway, different protocol.",
+        "12 · MAF + AnthropicClient (mirror of section 07)",
+        "Drives the gateway from `agent-framework` 1.0 via the Anthropic-protocol client. "
+        "Same MAF code paths as section 07 (single-turn / streaming / @tool / plain def / "
+        "workflow), but `AnthropicClient(anthropic_client=AsyncAnthropic(base_url=...))` "
+        "instead of `OpenAIChatCompletionClient`. Direct apples-to-apples for the "
+        "tool_result continuation 500.",
     )
-
-    c = _c()
-    model = config.TOOL_MODEL
-
-    # ── 1. Turn 1: model issues tool_use ─────────────────────────────────────
-    history: list[dict] = [
-        {"role": "user", "content": "What's the weather in Munich right now?"},
-    ]
-    try:
-        r1 = c.messages.create(
-            model=model,
-            max_tokens=400,
-            messages=history,
-            tools=[WEATHER_TOOL],
-        )
-    except Exception as e:  # noqa: BLE001
-        report.capture_exception(SECTION, "turn 1 · request tool_use", e)
-        report.add(SECTION, "turn 2 · tool_result continuation", FAIL,
-                   "skipped — turn 1 already failed")
+    if config.SKIP_MAF:
+        report.add(SECTION, "MAF section", SKIP, "SKIP_MAF=1 set in environment")
         return
-
-    tool_block = _first_tool_use(r1)
-    if not tool_block:
-        report.add(
-            SECTION,
-            "turn 1 · request tool_use",
-            WARN,
-            f"no tool_use block | stop_reason={r1.stop_reason} | "
-            f"types={[getattr(b, 'type', '?') for b in r1.content]}",
-        )
-        report.add(SECTION, "turn 2 · tool_result continuation", WARN,
-                   "skipped — model did not call the tool")
-        return
-
-    report.add(
-        SECTION,
-        "turn 1 · request tool_use",
-        PASS,
-        f"stop_reason={r1.stop_reason} | tool_use.name={tool_block.name} | "
-        f"input={short(json.dumps(tool_block.input), 80)} | "
-        f"usage={r1.usage.input_tokens}/{r1.usage.output_tokens}",
-    )
-
-    # ── 2. Turn 2: echo assistant + send tool_result back ────────────────────
-    history.append({
-        "role": "assistant",
-        "content": _content_blocks_for_echo(r1),
-    })
-    history.append({
-        "role": "user",
-        "content": [{
-            "type": "tool_result",
-            "tool_use_id": tool_block.id,
-            "content": json.dumps({"temperature_c": 22, "condition": "sunny"}),
-        }],
-    })
     try:
-        r2 = c.messages.create(
-            model=model,
-            max_tokens=400,
-            messages=history,
-            tools=[WEATHER_TOOL],
-        )
-        final_text = ""
-        for b in r2.content:
-            if getattr(b, "type", None) == "text":
-                final_text += b.text
-        ok = ("22" in final_text) or ("sunny" in final_text.lower())
-        report.add(
-            SECTION,
-            "turn 2 · tool_result continuation",
-            PASS if ok else WARN,
-            f"stop_reason={r2.stop_reason} | "
-            f"usage={r2.usage.input_tokens}/{r2.usage.output_tokens} | "
-            f"final={short(final_text, 140)}",
-        )
+        asyncio.run(_run_async(report))
     except Exception as e:  # noqa: BLE001
-        # THIS is the headline result — if it 500s, the gateway's broken on
-        # both protocols and the prior "Anthropic works" claim is wrong.
-        report.capture_exception(SECTION, "turn 2 · tool_result continuation", e)
-
-    # ── 3. tool_choice variants ──────────────────────────────────────────────
-    # Anthropic uses {"type": "auto"|"any"|"tool", ...}. "any" ≈ OpenAI "required".
-    for label, choice in [
-        ("tool_choice={'type':'auto'}", {"type": "auto"}),
-        ("tool_choice={'type':'any'} (force any tool)", {"type": "any"}),
-        ("tool_choice={'type':'tool', 'name':'get_time'} (specific)",
-         {"type": "tool", "name": "get_time"}),
-    ]:
-        try:
-            r = c.messages.create(
-                model=model,
-                max_tokens=300,
-                messages=[{"role": "user", "content": "Tell me a fact."}],
-                tools=[WEATHER_TOOL, TIME_TOOL],
-                tool_choice=choice,
-            )
-            tu_blocks = [b for b in r.content if getattr(b, "type", None) == "tool_use"]
-            if choice["type"] == "tool":
-                ok = any(b.name == choice["name"] for b in tu_blocks)
-            elif choice["type"] == "any":
-                ok = bool(tu_blocks)
-            else:  # auto — just want a successful call, tools optional
-                ok = True
-            report.add(
-                SECTION,
-                label,
-                PASS if ok else WARN,
-                f"stop={r.stop_reason} | tools={[b.name for b in tu_blocks]}",
-            )
-        except Exception as e:  # noqa: BLE001
-            report.capture_exception(SECTION, label, e)
-
-    # ── 4. Parallel tool use — model invokes 2 tools in one turn ─────────────
-    try:
-        r = c.messages.create(
-            model=model,
-            max_tokens=500,
-            messages=[{
-                "role": "user",
-                "content": "Get the weather in Munich AND the time in Asia/Shanghai in one go.",
-            }],
-            tools=[WEATHER_TOOL, TIME_TOOL],
-            tool_choice={"type": "auto"},
-        )
-        tu_blocks = [b for b in r.content if getattr(b, "type", None) == "tool_use"]
-        report.add(
-            SECTION,
-            "parallel tool_use (2 tools in one assistant turn)",
-            PASS if len(tu_blocks) >= 2 else WARN,
-            f"stop={r.stop_reason} | tools={[b.name for b in tu_blocks]}",
-        )
-    except Exception as e:  # noqa: BLE001
-        report.capture_exception(SECTION, "parallel tool_use", e)
-
-    # ── 5. Streaming with tool_use — verify the stream event surface ─────────
-    try:
-        tool_use_events = 0
-        input_json_deltas = 0
-        with c.messages.stream(
-            model=model,
-            max_tokens=400,
-            messages=[{"role": "user", "content": "What's the weather in Berlin?"}],
-            tools=[WEATHER_TOOL],
-        ) as stream:
-            for event in stream:
-                etype = getattr(event, "type", "")
-                if etype == "content_block_start":
-                    block = getattr(event, "content_block", None)
-                    if getattr(block, "type", None) == "tool_use":
-                        tool_use_events += 1
-                elif etype == "content_block_delta":
-                    delta = getattr(event, "delta", None)
-                    if getattr(delta, "type", None) == "input_json_delta":
-                        input_json_deltas += 1
-            final = stream.get_final_message()
-        tu_blocks = [b for b in final.content if getattr(b, "type", None) == "tool_use"]
-        ok = bool(tu_blocks)
-        report.add(
-            SECTION,
-            "messages.stream with tools",
-            PASS if ok else WARN,
-            f"tool_use blocks={len(tu_blocks)} | "
-            f"content_block_start(tool_use)={tool_use_events} | "
-            f"input_json_delta events={input_json_deltas} | "
-            f"final stop={final.stop_reason}",
-        )
-    except Exception as e:  # noqa: BLE001
-        report.capture_exception(SECTION, "messages.stream with tools", e)
-
-    # ── 6. Three-turn chain: tool_use → tool_result → user follow-up ─────────
-    # If turn-2 already passed, this confirms multi-step agent loops survive.
-    try:
-        chain: list[dict] = [
-            {"role": "user", "content": "What's the weather in Munich?"},
-        ]
-        s1 = c.messages.create(
-            model=model, max_tokens=300, messages=chain, tools=[WEATHER_TOOL],
-        )
-        tb = _first_tool_use(s1)
-        if not tb:
-            report.add(SECTION, "three-turn agent chain", WARN,
-                       "model did not call the tool on step 1 — skipping the rest")
-        else:
-            chain.append({"role": "assistant", "content": _content_blocks_for_echo(s1)})
-            chain.append({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result", "tool_use_id": tb.id,
-                    "content": json.dumps({"temperature_c": 5, "condition": "snowy"}),
-                }],
-            })
-            s2 = c.messages.create(
-                model=model, max_tokens=300, messages=chain, tools=[WEATHER_TOOL],
-            )
-            chain.append({"role": "assistant", "content": _content_blocks_for_echo(s2)})
-            chain.append({"role": "user",
-                          "content": "Should I wear a coat? Answer yes or no first."})
-            s3 = c.messages.create(
-                model=model, max_tokens=200, messages=chain, tools=[WEATHER_TOOL],
-            )
-            final = "".join(b.text for b in s3.content
-                            if getattr(b, "type", None) == "text")
-            ok = final.strip().lower().startswith(("yes", "no")) or "coat" in final.lower()
-            report.add(
-                SECTION,
-                "three-turn agent chain",
-                PASS if ok else WARN,
-                f"step3 stop={s3.stop_reason} | final={short(final, 120)}",
-            )
-    except Exception as e:  # noqa: BLE001
-        report.capture_exception(SECTION, "three-turn agent chain", e)
+        report.capture_exception(SECTION, "MAF section (top-level)", e)
 
 
 if __name__ == "__main__":

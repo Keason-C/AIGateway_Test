@@ -10,7 +10,7 @@ Round-4 mode (current default):
     - 05 Tool calling     (OpenAI role:"tool" continuation 500 — all 3 shapes)
     - 07 MAF integration  (downstream of 05)
     - 09 Context limit    (baseline 2k probe 500)
-    - 12 Anthropic tools  (NEW — full Anthropic tool_result continuation)
+    - 12 MAF + AnthropicClient  (NEW — mirror of test_07 over the Anthropic protocol)
 
 Run the full suite again with `python run_all_tests.py --full`.
 """
