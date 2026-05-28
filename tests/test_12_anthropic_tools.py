@@ -586,10 +586,11 @@ async def _run_async(report: Report) -> None:
     # Without this, GC closes it after asyncio.run() returns → the connection
     # pool tries to schedule callbacks on a closed loop and we get spurious
     # "RuntimeError: Event loop is closed" task-exception noise on Windows.
+    # NB: anthropic SDK names this `close()` (async), not `aclose()` like httpx.
     try:
-        await _raw_client.aclose()
+        await _raw_client.close()
     except Exception as e:  # noqa: BLE001 — best-effort cleanup
-        report.add(SECTION, "AsyncAnthropic.aclose", WARN, short(repr(e), 200))
+        report.add(SECTION, "AsyncAnthropic.close (cleanup)", WARN, short(repr(e), 200))
 
 
 def run(report: Report) -> None:
