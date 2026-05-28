@@ -21,6 +21,11 @@ MODULES = [
     "tests.test_05_tool_calling",
     "tests.test_06_anthropic_sdk",
     "tests.test_07_maf_integration",
+    # The parameter-effectiveness probes need fresh rate-limit budget
+    # because they fire many small calls in quick succession.
+    "tests.test_10_reasoning_params",
+    "tests.test_11_temperature_effectiveness",
+    # Heavy / quota-burning tests last
     "tests.test_08_concurrency",
     "tests.test_09_context_limit",
 ]

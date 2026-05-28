@@ -3,6 +3,7 @@
 
 # Generated outputs
 results/
+TEST_REPORT*.md
 assets/test_image.jpg
 assets/test_doc.pdf
 

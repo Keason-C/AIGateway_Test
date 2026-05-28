@@ -10,6 +10,7 @@ Strategy:
 """
 from __future__ import annotations
 
+import os
 import string
 import time
 
@@ -81,15 +82,32 @@ def run(report: Report) -> None:
         report.add(SECTION, "context-limit probe", SKIP, "SKIP_CONTEXT_LIMIT=1 set")
         return
 
+    # Cooldown — the concurrency test (test_08) typically drains the rate-limit
+    # budget right before this runs. The 429 we saw on the first round had
+    # nothing to do with context size; it was leftover quota pressure.
+    cooldown = int(os.getenv("CONTEXT_PROBE_COOLDOWN_S", "35"))
+    if cooldown > 0:
+        report.add(
+            SECTION,
+            f"rate-limit cooldown ({cooldown}s)",
+            INFO,
+            "waiting for the gateway's per-key budget to recover after test_08",
+        )
+        time.sleep(cooldown)
+
     lower = START_LOWER
     upper = config.CONTEXT_UPPER_TOKENS
 
-    # Sanity-check the lower bound first
+    # Sanity-check the lower bound first — with one quick retry on 429.
     ok, detail = _probe(lower)
+    if (not ok) and "429" in detail:
+        time.sleep(20)
+        ok, detail = _probe(lower)
+        detail = "(after extra 20s retry) " + detail
     report.add(SECTION, f"probe @ {lower:,} tokens (baseline)", PASS if ok else FAIL, detail)
     if not ok:
         report.add(SECTION, "context-limit probe", FAIL,
-                   "lower-bound baseline failed; gateway is too small for the configured search range")
+                   "lower-bound baseline failed even after retry; gateway is too small for the configured search range")
         return
 
     # And the upper bound (often this already fails fast)

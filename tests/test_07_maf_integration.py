@@ -53,16 +53,28 @@ def _import_tool():
     return tool, Field
 
 
-def _import_sequential():
-    try:
-        from agent_framework import SequentialBuilder  # type: ignore
-        return SequentialBuilder
-    except Exception:  # noqa: BLE001
+def _import_workflow_builder():
+    """Find a usable workflow builder class. Tries WorkflowBuilder first
+    (more general API), then falls back to the higher-level pattern builders
+    in case the pre-release version still ships them.
+
+    Returns (cls, kind) where kind is 'workflow' | 'sequential' | None.
+    """
+    candidates = [
+        ("agent_framework", "WorkflowBuilder", "workflow"),
+        ("agent_framework.workflows", "WorkflowBuilder", "workflow"),
+        ("agent_framework", "SequentialBuilder", "sequential"),
+        ("agent_framework.workflows", "SequentialBuilder", "sequential"),
+    ]
+    for module_name, cls_name, kind in candidates:
         try:
-            from agent_framework.workflows import SequentialBuilder  # type: ignore
-            return SequentialBuilder
-        except Exception:
-            return None
+            mod = importlib.import_module(module_name)
+            cls = getattr(mod, cls_name, None)
+            if cls is not None:
+                return cls, kind, f"{module_name}.{cls_name}"
+        except Exception:  # noqa: BLE001
+            continue
+    return None, None, ""
 
 
 async def _run_async(report: Report) -> None:
@@ -141,11 +153,13 @@ async def _run_async(report: Report) -> None:
         except Exception as e:  # noqa: BLE001
             report.capture_exception(SECTION, "@tool function call", e)
 
-    # 4. Sequential 2-agent workflow
-    Sequential = _import_sequential()
-    if Sequential is None:
-        report.add(SECTION, "SequentialBuilder workflow", SKIP, "SequentialBuilder not importable")
+    # 4. 2-agent workflow — prefer WorkflowBuilder, fall back to SequentialBuilder
+    BuilderCls, kind, fqn = _import_workflow_builder()
+    if BuilderCls is None:
+        report.add(SECTION, "workflow (2-agent)", SKIP,
+                   "neither WorkflowBuilder nor SequentialBuilder importable")
     else:
+        report.add(SECTION, "workflow builder import", PASS, f"using {fqn} ({kind})")
         try:
             client = _new_client()
             writer = client.as_agent(
@@ -155,25 +169,76 @@ async def _run_async(report: Report) -> None:
                 name="Shortener",
                 instructions="Rewrite the sentence in 3 words or fewer.",
             )
-            workflow = Sequential().add_agents([writer, shortener]).build()
-            output_text = ""
-            try:
-                async for event in workflow.run_stream("the moon"):
-                    out = getattr(event, "data", None) or getattr(event, "output", None)
-                    if out:
-                        output_text = str(out)
-            except AttributeError:
-                # API variant where you call workflow.run(...) directly
-                result = await workflow.run("the moon")
-                output_text = getattr(result, "text", None) or str(result)
-            report.add(
-                SECTION,
-                "SequentialBuilder workflow (writer → shortener)",
-                PASS if output_text.strip() else WARN,
-                short(output_text, 140),
-            )
+
+            # Build the graph depending on which class we got
+            workflow = None
+            build_err: Exception | None = None
+            if kind == "workflow":
+                # WorkflowBuilder: explicit edges. The exact method names vary slightly
+                # across pre-release versions, so try the documented shape then fall back.
+                tries = [
+                    lambda: (BuilderCls()
+                             .set_start_executor(writer)
+                             .add_edge(writer, shortener)
+                             .build()),
+                    lambda: (BuilderCls()
+                             .add_edge(writer, shortener)
+                             .set_start_executor(writer)
+                             .build()),
+                    lambda: (BuilderCls(start_executor=writer)
+                             .add_edge(writer, shortener)
+                             .build()),
+                ]
+                for t in tries:
+                    try:
+                        workflow = t()
+                        break
+                    except Exception as inner:  # noqa: BLE001
+                        build_err = inner
+            else:  # sequential
+                try:
+                    workflow = BuilderCls().add_agents([writer, shortener]).build()
+                except Exception as inner:  # noqa: BLE001
+                    try:
+                        workflow = BuilderCls().participants([writer, shortener]).build()
+                    except Exception as inner2:  # noqa: BLE001
+                        build_err = inner2
+
+            if workflow is None:
+                report.add(
+                    SECTION,
+                    "workflow build",
+                    FAIL,
+                    f"all builder API shapes failed | last={short(repr(build_err), 200)}",
+                )
+            else:
+                output_text = ""
+                # Try the stream-based API first, fall back to plain run()
+                ran = False
+                if hasattr(workflow, "run_stream"):
+                    try:
+                        async for event in workflow.run_stream("the moon"):
+                            data = (getattr(event, "data", None)
+                                    or getattr(event, "output", None)
+                                    or getattr(event, "text", None))
+                            if data:
+                                output_text = str(data)
+                        ran = True
+                    except Exception:  # noqa: BLE001
+                        ran = False
+                if not ran and hasattr(workflow, "run"):
+                    result = await workflow.run("the moon")
+                    output_text = (getattr(result, "text", None)
+                                    or getattr(result, "output", None)
+                                    or str(result))
+                report.add(
+                    SECTION,
+                    f"workflow run (writer → shortener) [{kind}]",
+                    PASS if output_text.strip() else WARN,
+                    short(output_text, 160),
+                )
         except Exception as e:  # noqa: BLE001
-            report.capture_exception(SECTION, "SequentialBuilder workflow", e)
+            report.capture_exception(SECTION, "workflow execution", e)
 
 
 def run(report: Report) -> None:
