@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Generated outputs
+results/
+assets/test_image.jpg
+assets/test_doc.pdf
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Editor
+.idea/
+.vscode/
+*.swp
