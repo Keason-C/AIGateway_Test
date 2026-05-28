@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 from typing import Annotated
 
 from . import config
@@ -134,18 +135,23 @@ async def _run_async(report: Report) -> None:
 
     # Pre-built AsyncAnthropic pointed at the ZF gateway. The Anthropic SDK
     # appends /v1/messages itself, so we use config.ANTHROPIC_BASE_URL (no /v1).
-    def _new_client():
-        raw = AsyncAnthropic(
-            api_key=config.API_KEY,
-            base_url=config.ANTHROPIC_BASE_URL,
-            timeout=60.0,
-            max_retries=0,
-        )
-        return ClientCls(model=config.TOOL_MODEL, anthropic_client=raw)
+    # IMPORTANT: build ONE AsyncAnthropic for the whole section and close it
+    # at the end. Previously we built a fresh one per check and never aclose'd
+    # them — GC fired after asyncio.run() had torn down the loop and produced
+    # "RuntimeError: Event loop is closed" noise on Windows ProactorEventLoop.
+    # MAF skill convention #3 ("manage credentials/agents with async with")
+    # covers this — we use explicit aclose() because we want the `client` to
+    # remain visible to every check below without re-indenting the world.
+    _raw_client = AsyncAnthropic(
+        api_key=config.API_KEY,
+        base_url=config.ANTHROPIC_BASE_URL,
+        timeout=60.0,
+        max_retries=0,
+    )
+    client = ClientCls(model=config.TOOL_MODEL, anthropic_client=_raw_client)
 
     # ── 1. Single-turn agent.run ────────────────────────────────────────────
     try:
-        client = _new_client()
         agent = _new_agent(client, name="ZFAgentA", instructions="You are concise.")
         result = await agent.run("Reply with the word: pong")
         text = getattr(result, "text", None) or str(result)
@@ -156,7 +162,6 @@ async def _run_async(report: Report) -> None:
 
     # ── 2. Streaming via agent.run(..., stream=True) ────────────────────────
     try:
-        client = _new_client()
         agent = _new_agent(client, name="ZFAgentB", instructions="You are concise.")
         chunks: list[str] = []
         async for chunk in agent.run("Count from 1 to 3.", stream=True):
@@ -199,7 +204,6 @@ async def _run_async(report: Report) -> None:
                     """Return n squared."""
                     return n * n
 
-            client = _new_client()
             agent = _new_agent(
                 client,
                 name="MathAgentA",
@@ -238,7 +242,6 @@ async def _run_async(report: Report) -> None:
                     """Add two integers."""
                     return a + b
 
-            client = _new_client()
             agent = _new_agent(
                 client,
                 name="MathAgentB",
@@ -290,7 +293,6 @@ async def _run_async(report: Report) -> None:
                     """Get the current local time for a timezone."""
                     return f"The current time in {timezone} is 14:30."
 
-            client = _new_client()
             agent = _new_agent(
                 client,
                 name="ConciergeAgent",
@@ -310,6 +312,182 @@ async def _run_async(report: Report) -> None:
         except Exception as e:  # noqa: BLE001
             report.capture_exception(SECTION, "multi-tool agent", e)
 
+        # ── 3d — Diagnostic: AnthropicClient WITHOUT default beta headers.
+        # MAF's AnthropicClient defaults to additional_beta_flags=[
+        #   "mcp-client-2025-04-04", "code-execution-2025-08-25"
+        # ] which become an "anthropic-beta:" request header. The ZF gateway
+        # may reject those when tools are also present (single-turn agent.run
+        # works → beta headers alone are tolerated; @tool 500s → it's the
+        # beta+tools combination). Pass additional_beta_flags=[] to suppress.
+        try:
+            client_no_beta = ClientCls(
+                model=config.TOOL_MODEL,
+                anthropic_client=_raw_client,
+                additional_beta_flags=[],
+            )
+
+            if Field is not None:
+                @tool(approval_mode="never_require")
+                def square_nb(
+                    n: Annotated[int, Field(description="The integer to square.")],
+                ) -> int:
+                    """Return n squared."""
+                    return n * n
+            else:
+                @tool(approval_mode="never_require")
+                def square_nb(  # type: ignore[no-redef]
+                    n: Annotated[int, "The integer to square."],
+                ) -> int:
+                    """Return n squared."""
+                    return n * n
+
+            agent_nb = _new_agent(
+                client_no_beta,
+                name="MathAgentNoBeta",
+                instructions="When asked to square a number, call the square_nb tool. "
+                             "After it returns, reply with just the number.",
+                tools=[square_nb],
+            )
+            result = await agent_nb.run("Use your tool to square the number 7.")
+            text = getattr(result, "text", None) or str(result)
+            ok = "49" in text
+            report.add(
+                SECTION,
+                "@tool with additional_beta_flags=[] (suppress MAF defaults)",
+                PASS if ok else WARN,
+                short(text, 160),
+            )
+        except Exception as e:  # noqa: BLE001
+            report.capture_exception(
+                SECTION,
+                "@tool with additional_beta_flags=[] (suppress MAF defaults)",
+                e,
+            )
+
+        # ── 3e — Diagnostic: simple @tool form matching `02_add_tools.py`
+        # verbatim — plain `str` parameter, no Annotated, no Field, just
+        # the docstring. If THIS passes while the Annotated+Field form 500s,
+        # MAF is serializing Field metadata the gateway rejects. If it ALSO
+        # 500s, the gateway treats Annotated+Field and plain str the same.
+        try:
+            @tool(approval_mode="never_require")
+            def get_weather_simple(location: str) -> str:
+                """Get the weather for a given location."""
+                return f"The weather in {location} is sunny, 22°C."
+
+            client_simple = ClientCls(
+                model=config.TOOL_MODEL,
+                anthropic_client=_raw_client,
+                additional_beta_flags=[],   # combine both fixes
+            )
+            agent_simple = _new_agent(
+                client_simple,
+                name="SimpleWeatherAgent",
+                instructions="When asked about weather, call get_weather_simple "
+                             "and reply with one short sentence using its result.",
+                tools=[get_weather_simple],
+            )
+            result = await agent_simple.run("What's the weather in Berlin?")
+            text = getattr(result, "text", None) or str(result)
+            ok = ("22" in text) or ("sunny" in text.lower()) or ("berlin" in text.lower())
+            report.add(
+                SECTION,
+                "@tool simple form (plain str, matches 02_add_tools.py)",
+                PASS if ok else WARN,
+                short(text, 160),
+            )
+        except Exception as e:  # noqa: BLE001
+            report.capture_exception(
+                SECTION,
+                "@tool simple form (plain str, matches 02_add_tools.py)",
+                e,
+            )
+
+    # ── 3f — Raw AsyncAnthropic two-turn round-trip diagnostic ──────────────
+    # Bypasses MAF entirely: hand-builds the {"role":"user", "content":[
+    # {"type":"tool_result", ...}]} continuation. Pinpoints whether the 500
+    # in checks 3a/3b/3c originates from MAF wrapping (turn-1 schema or
+    # headers) or from the gateway's tool_result continuation path itself.
+    # Reuses the same _raw_client that everything else uses.
+    try:
+        history = [{"role": "user", "content": "What's the weather in Munich?"}]
+        tool_def = {
+            "name": "get_weather",
+            "description": "Get the current weather for a given city.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        }
+        r1 = await _raw_client.messages.create(
+            model=config.TOOL_MODEL,
+            max_tokens=300,
+            messages=history,
+            tools=[tool_def],
+        )
+        tool_block = next(
+            (b for b in r1.content if getattr(b, "type", None) == "tool_use"), None
+        )
+        if not tool_block:
+            report.add(
+                SECTION,
+                "raw AsyncAnthropic · turn 1 (tool_use)",
+                WARN,
+                f"no tool_use block | stop_reason={r1.stop_reason}",
+            )
+        else:
+            report.add(
+                SECTION,
+                "raw AsyncAnthropic · turn 1 (tool_use)",
+                PASS,
+                f"stop={r1.stop_reason} | name={tool_block.name} | "
+                f"input={short(json.dumps(tool_block.input), 80)}",
+            )
+            # Turn 2 — feed tool_result back. THIS is the deciding check.
+            history.append({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": tool_block.id,
+                    "name": tool_block.name,
+                    "input": tool_block.input,
+                }],
+            })
+            history.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_block.id,
+                    "content": json.dumps({"temperature_c": 22, "condition": "sunny"}),
+                }],
+            })
+            try:
+                r2 = await _raw_client.messages.create(
+                    model=config.TOOL_MODEL,
+                    max_tokens=300,
+                    messages=history,
+                    tools=[tool_def],
+                )
+                final = "".join(
+                    b.text for b in r2.content if getattr(b, "type", None) == "text"
+                )
+                ok = ("22" in final) or ("sunny" in final.lower())
+                report.add(
+                    SECTION,
+                    "raw AsyncAnthropic · turn 2 (tool_result continuation)",
+                    PASS if ok else WARN,
+                    f"stop={r2.stop_reason} | final={short(final, 120)}",
+                )
+            except Exception as e:  # noqa: BLE001
+                report.capture_exception(
+                    SECTION,
+                    "raw AsyncAnthropic · turn 2 (tool_result continuation)",
+                    e,
+                )
+    except Exception as e:  # noqa: BLE001
+        report.capture_exception(SECTION, "raw AsyncAnthropic · turn 1 (tool_use)", e)
+
     # ── 4. Two-agent workflow (writer → shortener) ──────────────────────────
     BuilderCls, kind, fqn = _import_workflow_builder()
     if BuilderCls is None:
@@ -317,7 +495,6 @@ async def _run_async(report: Report) -> None:
                    "neither WorkflowBuilder nor SequentialBuilder importable")
     else:
         try:
-            client = _new_client()
             writer = _new_agent(
                 client,
                 name="Writer", instructions="Write one short sentence about the topic.",
@@ -404,6 +581,15 @@ async def _run_async(report: Report) -> None:
                 )
         except Exception as e:  # noqa: BLE001
             report.capture_exception(SECTION, "workflow execution", e)
+
+    # ── Cleanup: close the shared AsyncAnthropic before the event loop dies.
+    # Without this, GC closes it after asyncio.run() returns → the connection
+    # pool tries to schedule callbacks on a closed loop and we get spurious
+    # "RuntimeError: Event loop is closed" task-exception noise on Windows.
+    try:
+        await _raw_client.aclose()
+    except Exception as e:  # noqa: BLE001 — best-effort cleanup
+        report.add(SECTION, "AsyncAnthropic.aclose", WARN, short(repr(e), 200))
 
 
 def run(report: Report) -> None:

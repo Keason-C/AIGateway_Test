@@ -106,16 +106,19 @@ async def _run_async(report: Report) -> None:
         return
     report.add(SECTION, "import OpenAIChatCompletionClient", PASS, ClientCls.__module__)
 
-    def _new_client():
-        return ClientCls(
-            base_url=config.BASE_URL,
-            api_key=config.API_KEY,
-            model=config.MODEL,
-        )
+    # IMPORTANT: build ONE OpenAIChatCompletionClient for the whole section
+    # and best-effort close its inner AsyncOpenAI's httpx pool at the end —
+    # otherwise GC closes it after asyncio.run() returns and we get spurious
+    # "RuntimeError: Event loop is closed" task-exception noise on Windows
+    # (ProactorEventLoop + httpx). MAF skill convention #3 covers this.
+    client = ClientCls(
+        base_url=config.BASE_URL,
+        api_key=config.API_KEY,
+        model=config.MODEL,
+    )
 
     # 1. Single-turn agent.run
     try:
-        client = _new_client()
         agent = _new_agent(client, name="ZFAgent", instructions="You are concise.")
         result = await agent.run("Reply with the word: pong")
         text = getattr(result, "text", None) or str(result)
@@ -126,7 +129,6 @@ async def _run_async(report: Report) -> None:
 
     # 2. Streaming via agent.run(..., stream=True)
     try:
-        client = _new_client()
         agent = _new_agent(client, name="ZFAgent", instructions="You are concise.")
         chunks: list[str] = []
         async for chunk in agent.run("Count from 1 to 3.", stream=True):
@@ -170,7 +172,6 @@ async def _run_async(report: Report) -> None:
                     """Return n squared."""
                     return n * n
 
-            client = _new_client()
             agent = _new_agent(
                 client,
                 name="MathAgent",
@@ -210,7 +211,6 @@ async def _run_async(report: Report) -> None:
                     """Add two integers."""
                     return a + b
 
-            client = _new_client()
             agent = _new_agent(
                 client,
                 name="MathAgent2",
@@ -237,7 +237,6 @@ async def _run_async(report: Report) -> None:
     else:
         report.add(SECTION, "workflow builder import", PASS, f"using {fqn} ({kind})")
         try:
-            client = _new_client()
             writer = _new_agent(
                 client,
                 name="Writer", instructions="Write one short sentence about the topic.",
@@ -330,6 +329,18 @@ async def _run_async(report: Report) -> None:
                 )
         except Exception as e:  # noqa: BLE001
             report.capture_exception(SECTION, "workflow execution", e)
+
+    # Best-effort cleanup of the inner AsyncOpenAI's httpx pool. Same reason
+    # as test_12: without explicit close, GC fires after asyncio.run() returns
+    # and produces spurious "RuntimeError: Event loop is closed" task-exception
+    # noise on Windows (ProactorEventLoop + httpx).
+    inner = getattr(client, "client", None)
+    close_fn = getattr(inner, "close", None) if inner is not None else None
+    if close_fn is not None:
+        try:
+            await close_fn()
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
 
 
 def run(report: Report) -> None:
