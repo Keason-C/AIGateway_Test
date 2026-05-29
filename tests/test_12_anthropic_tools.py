@@ -148,7 +148,14 @@ async def _run_async(report: Report) -> None:
         timeout=60.0,
         max_retries=0,
     )
-    client = ClientCls(model=config.TOOL_MODEL, anthropic_client=_raw_client)
+    # additional_beta_flags=[] is the proven production fix: MAF's default beta
+    # flags (mcp-client / code-execution) become an `anthropic-beta` header that
+    # 500s this gateway as soon as `tools` are attached. Clearing them is what
+    # makes @tool work — checks 1/2/3a/3b/3c below all rely on this. (Section 13
+    # keeps a default-flags row as the explicit root-cause contrast.)
+    client = ClientCls(
+        model=config.TOOL_MODEL, anthropic_client=_raw_client, additional_beta_flags=[]
+    )
 
     # ── 1. Single-turn agent.run ────────────────────────────────────────────
     try:

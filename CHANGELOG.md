@@ -4,6 +4,19 @@
 
 ---
 
+## [v0.1.2] - 2026-05-29 13:45
+
+### 变更内容
+- 定位并修复 MAF @tool 在网关上 500 的根因（Anthropic 路径）：MAF 的 `AnthropicClient` 默认 beta flags（`mcp-client` / `code-execution`）会变成 `anthropic-beta` 请求头，网关在「带 tools」时 500。清空 `additional_beta_flags=[]` 即可，已对齐生产代码。
+- `test_13`：AnthropicClient 加 `additional_beta_flags=[]` + `max_tokens`（@tool 现在应通过）；保留「默认 flags → 500」根因对照行；Responses 探针由 ❌ 改为 ℹ️（本就预期不可用）；新增绕开 MAF 的原生 openai SDK 两轮工具探针（turn-1 vs turn-2），用于判定 OpenAI 的 500 是请求带 tools 还是续轮所致。
+- `test_12`：主 `AnthropicClient` 同样加 `additional_beta_flags=[]`，否则其工具检查会撞同一个 500。
+
+### 涉及文件
+- `tests/test_13_maf_compatibility.py` — beta flags + max_tokens、根因对照、Responses→INFO、OpenAI 原生两轮隔离探针。
+- `tests/test_12_anthropic_tools.py` — 主 AnthropicClient 改用 `additional_beta_flags=[]`。
+
+---
+
 ## [v0.1.1] - 2026-05-29 13:06
 
 ### 变更内容
