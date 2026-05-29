@@ -4,6 +4,20 @@
 
 ---
 
+## [v0.1.1] - 2026-05-29 13:06
+
+### 变更内容
+- 默认运行收窄为「只跑 section 13」（MAF 兼容性矩阵）。`run_all_tests.py` 默认只执行 `test_13`，回答「MAF 在网关上能否工作、该选哪个 client」这一个问题。
+- 深度 MAF 诊断（07、12）与全部非 MAF section（01-06、08-11）一并移到 `--full` 之后；模块清单重命名为 `DEFAULT_MODULES` / `EXTRA_MODULES`。
+- 文档（README、CLAUDE.md）同步更新为「默认 = section 13」。
+
+### 涉及文件
+- `run_all_tests.py` — 默认模块列表改为仅 `test_13`；07/12 与非 MAF section 归入 `EXTRA_MODULES`（`--full` 时运行）；更新 docstring 与运行模式标签。
+- `README.md` — 顶部说明与测试表标注改为「默认只跑 13」。
+- `CLAUDE.md` — 运行命令与模块列表说明同步更新。
+
+---
+
 ## [初始版本] - 2026-05-29 11:11
 
 ### 项目概述

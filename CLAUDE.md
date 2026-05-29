@@ -18,10 +18,10 @@ python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\ac
 pip install -r requirements.txt
 cp .env.example .env                                  # then put a real ZF_API_KEY in .env
 
-# Run — DEFAULT is MAF-only: sections 13 (matrix) + 07 + 12
+# Run — DEFAULT is section 13 only (the MAF compatibility matrix)
 python run_all_tests.py
 
-# Run the COMPLETE suite (MAF + all the non-MAF sections 01-06, 08-11)
+# Run the COMPLETE suite (13 + deep MAF diagnostics 07/12 + non-MAF 01-06, 08-11)
 python run_all_tests.py --full
 
 # Run / re-probe a single section standalone (writes results/test_NN_only.md)
@@ -34,7 +34,7 @@ SKIP_CONCURRENCY=1 SKIP_CONTEXT_LIMIT=1 SKIP_MAF=1 python run_all_tests.py
 
 There is **no pytest, linter, or build step** — `python_requires` is 3.10+. "Tests" are plain modules executed for their side effect (appending rows to a report). `run_all_tests.py` puts the repo root on `sys.path` so `tests.*` and `assets.*` imports resolve regardless of cwd.
 
-⚠️ `python run_all_tests.py` with no flag does **not** run everything — it runs only `MAF_MODULES` (`tests.test_13_maf_compatibility`, `test_07`, `test_12`). Use `--full` to also run `OTHER_MODULES` (the non-MAF sections). The two lists live at the top of `run_all_tests.py`.
+⚠️ `python run_all_tests.py` with no flag does **not** run everything — it runs only `DEFAULT_MODULES` (just `tests.test_13_maf_compatibility`). Use `--full` to also run `EXTRA_MODULES` (the deep MAF diagnostics 07/12 and the non-MAF sections). The two lists live at the top of `run_all_tests.py`.
 
 ## Architecture
 

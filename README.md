@@ -2,7 +2,7 @@
 
 A one-shot test harness for the ZF internal AI Assistant Suite gateway (`https://ai-assistant-suite-staging.azurewebsites.net`). Run it on a machine that **can** reach the gateway (company server / VPN), then send the generated `results/TEST_REPORT.md` back for analysis.
 
-> **Default run is now MAF-only.** `python run_all_tests.py` runs just the Microsoft Agent Framework sections — **13** (the headline cross-client matrix), **07**, and **12** — to answer "does MAF work on the gateway, and which client do you pick?". The non-MAF sections below (01-06, 08-11) are kept on disk but only run with `--full`. Failures in the report now include a collapsible **🪵 Failure logs** block with the full traceback for debugging.
+> **Default run is just section 13.** `python run_all_tests.py` runs only the MAF compatibility matrix (**13**) — it answers "does MAF work on the gateway, and which client do you pick?" in one table. Everything else (the deep MAF diagnostics 07/12 and the non-MAF sections 01-06, 08-11) is kept on disk and only runs with `--full`. Failures in the report include a collapsible **🪵 Failure logs** block with the full traceback for debugging.
 
 ## What it tests
 
@@ -19,8 +19,8 @@ A one-shot test harness for the ZF internal AI Assistant Suite gateway (`https:/
 | 09 | `test_09_context_limit` | Binary search for the largest user-message size the gateway will accept, measured in cl100k_base tokens. |
 | 10 | `test_10_reasoning_params` | Whether the gateway honors `reasoning_effort` (o-series) — compares token/latency across effort levels. |
 | 11 | `test_11_temperature_effectiveness` | Whether API-level `temperature` overrides the assistant's baked-in value (inferred from response spread). |
-| 12 | `test_12_anthropic_tools` | **(MAF, default)** Deep diagnostics for MAF + `AnthropicClient` (`/v1/messages`): single-turn, streaming, `@tool` (several forms), multi-tool, raw round-trip, workflow. |
-| 13 | `test_13_maf_compatibility` | **(MAF, default — headline)** Cross-client matrix: `OpenAIChatClient` (Responses `/responses`, expect 404) vs `OpenAIChatCompletionClient` (Chat Completions, expect ✅) vs `AnthropicClient` (expect ✅), each × [connectivity / streaming / `@tool` / 2-agent workflow]. |
+| 12 | `test_12_anthropic_tools` | **(MAF, --full)** Deep diagnostics for MAF + `AnthropicClient` (`/v1/messages`): single-turn, streaming, `@tool` (several forms), multi-tool, raw round-trip, workflow. |
+| 13 | `test_13_maf_compatibility` | **(MAF, DEFAULT — headline)** Cross-client matrix: `OpenAIChatClient` (Responses `/responses`, expect 404) vs `OpenAIChatCompletionClient` (Chat Completions, expect ✅) vs `AnthropicClient` (expect ✅), each × [connectivity / streaming / `@tool` / 2-agent workflow]. |
 
 Every test result is collected by `tests/reporter.py` and dumped at the end into a single `results/TEST_REPORT.md`.
 
