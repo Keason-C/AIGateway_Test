@@ -20,3 +20,8 @@ venv/
 .idea/
 .vscode/
 *.swp
+
+# Claude Code local state / scratch reference files
+.claude/
+agent-framework.pdf
+image.png

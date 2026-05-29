@@ -69,9 +69,25 @@ class Report:
     def block(self, section_key: str, markdown: str) -> None:
         self.section(section_key).blocks.append(markdown)
 
-    def capture_exception(self, section_key: str, name: str, exc: BaseException) -> None:
-        tb = "".join(traceback.format_exception_only(type(exc), exc)).strip()
-        self.add(section_key, name, FAIL, f"`{tb}`")
+    def capture_exception(
+        self,
+        section_key: str,
+        name: str,
+        exc: BaseException,
+        note: str = "",
+    ) -> None:
+        """Record a failure. The table cell keeps a one-line summary; the FULL
+        traceback (incl. any HTTP response body the SDK put in the message) is
+        stashed in `extra["traceback"]` and rendered as a collapsible code block
+        in the report — so a 500 on a tool call can actually be debugged."""
+        summary = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+        full_tb = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        ).strip()
+        detail = f"`{short(summary, 280)}`"
+        if note:
+            detail = f"{note} — {detail}"
+        self.add(section_key, name, FAIL, detail, extra={"traceback": full_tb})
 
     def write_markdown(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,6 +134,26 @@ class Report:
                 out.append("")
             for blk in sec.blocks:
                 out.append(blk)
+                out.append("")
+
+            # Full failure logs (tracebacks) for debugging — collapsed by default.
+            fail_logs = [
+                (r.name, r.extra["traceback"])
+                for r in sec.rows
+                if r.extra.get("traceback")
+            ]
+            if fail_logs:
+                out.append("<details>")
+                out.append(f"<summary>🪵 Failure logs ({len(fail_logs)}) — full tracebacks</summary>")
+                out.append("")
+                for nm, tb in fail_logs:
+                    out.append(f"**{nm}**")
+                    out.append("")
+                    out.append("```text")
+                    out.append(tb)
+                    out.append("```")
+                    out.append("")
+                out.append("</details>")
                 out.append("")
 
         # Auto-generated conclusion

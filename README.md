@@ -2,6 +2,8 @@
 
 A one-shot test harness for the ZF internal AI Assistant Suite gateway (`https://ai-assistant-suite-staging.azurewebsites.net`). Run it on a machine that **can** reach the gateway (company server / VPN), then send the generated `results/TEST_REPORT.md` back for analysis.
 
+> **Default run is now MAF-only.** `python run_all_tests.py` runs just the Microsoft Agent Framework sections — **13** (the headline cross-client matrix), **07**, and **12** — to answer "does MAF work on the gateway, and which client do you pick?". The non-MAF sections below (01-06, 08-11) are kept on disk but only run with `--full`. Failures in the report now include a collapsible **🪵 Failure logs** block with the full traceback for debugging.
+
 ## What it tests
 
 | # | Test module | What it answers |
@@ -15,6 +17,10 @@ A one-shot test harness for the ZF internal AI Assistant Suite gateway (`https:/
 | 07 | `test_07_maf_integration` | Microsoft Agent Framework 1.0 driving the gateway via `OpenAIChatCompletionClient`. Single-turn, streaming, `@tool` function calling, sequential 2-agent workflow. |
 | 08 | `test_08_concurrency` | Concurrency ramp 1 → 5 → 10 → 20 → 50 → 100, records p50/p95/max latency, identifies the first level that starts failing (= practical concurrency ceiling). |
 | 09 | `test_09_context_limit` | Binary search for the largest user-message size the gateway will accept, measured in cl100k_base tokens. |
+| 10 | `test_10_reasoning_params` | Whether the gateway honors `reasoning_effort` (o-series) — compares token/latency across effort levels. |
+| 11 | `test_11_temperature_effectiveness` | Whether API-level `temperature` overrides the assistant's baked-in value (inferred from response spread). |
+| 12 | `test_12_anthropic_tools` | **(MAF, default)** Deep diagnostics for MAF + `AnthropicClient` (`/v1/messages`): single-turn, streaming, `@tool` (several forms), multi-tool, raw round-trip, workflow. |
+| 13 | `test_13_maf_compatibility` | **(MAF, default — headline)** Cross-client matrix: `OpenAIChatClient` (Responses `/responses`, expect 404) vs `OpenAIChatCompletionClient` (Chat Completions, expect ✅) vs `AnthropicClient` (expect ✅), each × [connectivity / streaming / `@tool` / 2-agent workflow]. |
 
 Every test result is collected by `tests/reporter.py` and dumped at the end into a single `results/TEST_REPORT.md`.
 
@@ -89,5 +95,6 @@ python -m tests.test_09_context_limit
 - The gateway used to return **HTTP 500 when `max_tokens` is sent on `/v1/chat/completions`**, but round-2 testing showed it's been fixed. Test 01 still probes it so we'll know if it regresses.
 - There is **no server-side memory**. Multi-turn tests pre-build the `messages` list each call.
 - PDFs: the speculative OpenAI `file` block now also works, in addition to the PyPDF2-text and pymupdf-as-image strategies. Test 04 exercises all three.
-- The Microsoft Agent Framework's `OpenAIChatClient` hits `/responses` (OpenAI Responses API) and 404s on this gateway. We use `OpenAIChatCompletionClient` instead — which hits `/chat/completions`.
+- The Microsoft Agent Framework's `OpenAIChatClient` hits `/responses` (OpenAI Responses API) and 404s on this gateway. We use `OpenAIChatCompletionClient` instead — which hits `/chat/completions`. Test 13 probes both head-to-head so the report states it plainly.
+- **Tool calling on this gateway is known to work** (confirmed by hand). So a `@tool` failure in the MAF sections points at MAF wiring/version or the wrong client, not the gateway. The MAF tests use the canonical shapes from the audited `microsoft-agent-framework` skill, and every failure is logged with its full traceback in the report.
 - On the **assistant-with-tool_calls** turn, the gateway 500s if `content: ""` is sent. The spec-correct shape (and MAF's wire shape) is to **omit `content` entirely**. Test 05 now exercises all three variants — omit / null / `""` — so we can see which the gateway accepts.

@@ -1,18 +1,17 @@
-"""Run every test module and produce results/TEST_REPORT.md.
+"""Run the test modules and produce results/TEST_REPORT.md.
 
-A failure in any single module is captured into the report and does not
-prevent the rest of the suite from running.
+A failure in any single module is captured into the report (with its FULL
+traceback, see tests/reporter.py) and does not stop the rest of the suite.
 
-Round-4 mode (current default):
-  Round 3 produced clean passes for sections 01, 02, 03, 06, 08, 10, 11.
-  We skip them by default to save quota and focus on the open failures:
-    - 04 Multimodal       (HTTPS image URL still 500)
-    - 05 Tool calling     (OpenAI role:"tool" continuation 500 — all 3 shapes)
-    - 07 MAF integration  (downstream of 05)
-    - 09 Context limit    (baseline 2k probe 500)
-    - 12 MAF + AnthropicClient  (NEW — mirror of test_07 over the Anthropic protocol)
+MAF mode (current default):
+  The focus is now the gateway's compatibility with the Microsoft Agent
+  Framework. By default we run ONLY the MAF sections:
+    - 13 MAF compatibility matrix  (headline: 3 clients × capability matrix)
+    - 07 MAF + OpenAIChatCompletionClient  (deep per-client diagnostics)
+    - 12 MAF + AnthropicClient             (deep per-client diagnostics)
 
-Run the full suite again with `python run_all_tests.py --full`.
+  The non-MAF sections (01-06, 08-11) are kept on disk but not run by default.
+  Re-enable the whole suite with `python run_all_tests.py --full`.
 """
 from __future__ import annotations
 
@@ -24,23 +23,27 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
-# Sections that already passed in Round 3 — re-enable with --full.
-PASSED_MODULES = [
+# Default run: everything that exercises the Microsoft Agent Framework.
+# test_13 is the headline cross-client matrix; 07 and 12 are the deeper
+# per-client diagnostics (raw round-trips, beta-flag toggles) that pinpoint
+# where a 500 originates if a cell in 13 fails.
+MAF_MODULES = [
+    "tests.test_13_maf_compatibility",
+    "tests.test_07_maf_integration",
+    "tests.test_12_anthropic_tools",
+]
+
+# Non-MAF sections — kept on disk, only run with --full.
+OTHER_MODULES = [
     "tests.test_01_openai_basic",
     "tests.test_02_openai_params",
     "tests.test_03_streaming",
+    "tests.test_04_multimodal",
+    "tests.test_05_tool_calling",
     "tests.test_06_anthropic_sdk",
     "tests.test_10_reasoning_params",
     "tests.test_11_temperature_effectiveness",
     "tests.test_08_concurrency",
-]
-
-# Sections that still have ❌ failures, plus the new Anthropic tool round-trip.
-FAILING_MODULES = [
-    "tests.test_04_multimodal",
-    "tests.test_05_tool_calling",
-    "tests.test_07_maf_integration",
-    "tests.test_12_anthropic_tools",
     # Context limit is quota-heavy, keep it last.
     "tests.test_09_context_limit",
 ]
@@ -51,13 +54,13 @@ def main() -> int:
     sys.path.insert(0, str(ROOT))
 
     full = "--full" in sys.argv
-    modules = (PASSED_MODULES + FAILING_MODULES) if full else FAILING_MODULES
+    modules = (MAF_MODULES + OTHER_MODULES) if full else MAF_MODULES
 
     from tests import config
     from tests.reporter import FAIL, Report
 
     print("=" * 70)
-    print(f"ZF AI Gateway — {'FULL' if full else 'ROUND-4 (failures only)'} test suite")
+    print(f"ZF AI Gateway — {'FULL' if full else 'MAF-only'} test suite")
     print("=" * 70)
     print(config.summary())
     print(f"Modules to run: {len(modules)}")
@@ -68,7 +71,7 @@ def main() -> int:
         "BASE_URL": config.BASE_URL,
         "MODEL": config.MODEL,
         "TOOL_MODEL": config.TOOL_MODEL,
-        "SUITE_MODE": "full" if full else "round-4 (failures + new anthropic tools)",
+        "SUITE_MODE": "full" if full else "MAF-only (07 + 12 + 13)",
     }
 
     for mod_name in modules:
